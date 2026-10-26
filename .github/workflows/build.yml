@@ -1,0 +1,65 @@
+name: Build Windows installer
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand payload (sanitized app + installer files)
+        shell: pwsh
+        run: |
+          Expand-Archive payload.zip -DestinationPath p
+          if (!(Test-Path p\app\server.js)) { throw 'payload missing app/server.js' }
+          if (!(Test-Path p\installer\schoolhub.nsi)) { throw 'payload missing installer/schoolhub.nsi' }
+      - name: Download portable Node runtime (latest v22 win-x64)
+        shell: pwsh
+        run: |
+          $sums = (Invoke-WebRequest 'https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt').Content
+          $name = ([regex]::Match($sums, 'node-v22[\d.]*-win-x64\.zip')).Value
+          if (!$name) { throw 'could not resolve latest v22 win-x64 zip name' }
+          Invoke-WebRequest "https://nodejs.org/dist/latest-v22.x/$name" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath noder
+          New-Item -ItemType Directory -Force p\payload\runtime | Out-Null
+          Copy-Item "noder\$($name -replace '\.zip$','')\node.exe" p\payload\runtime\node.exe
+      - name: Assemble installer payload (app code only; no tests/docs/private data)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force p\payload\app | Out-Null
+          Copy-Item p\app\server.js, p\app\package.json p\payload\app\
+          Copy-Item -Recurse p\app\public p\payload\app\public
+          Copy-Item p\installer\launcher.vbs, p\installer\stop.vbs, p\installer\README-FIRST.txt p\payload\
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          Push-Location p\installer
+          makensis /V2 schoolhub.nsi
+          Pop-Location
+          $exe = Get-ChildItem -Recurse -Filter 'SchoolHub-Manager-Setup.exe' | Select-Object -First 1
+          if (!$exe) { throw 'installer not produced' }
+          Copy-Item $exe.FullName .\SchoolHub-Manager-Setup.exe -Force
+          (Get-Item .\SchoolHub-Manager-Setup.exe).Length
+      - name: Smoke test on real Windows (install, launch, login, write, restart, data)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File p\installer\smoke.ps1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SchoolHub-Manager-Setup
+          path: SchoolHub-Manager-Setup.exe
+      - name: Publish release (automatic GITHUB_TOKEN, no personal token)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ inputs.release_tag }}'
+          $exists = $false
+          try { gh release view $tag | Out-Null; $exists = $true } catch {}
+          if ($exists) { gh release upload $tag .\SchoolHub-Manager-Setup.exe --clobber }
+          else { gh release create $tag .\SchoolHub-Manager-Setup.exe --title "SchoolHub Manager $tag" --notes "Windows setup. Installer unsigned: Windows may show Unknown publisher - More info > Run anyway. First login credentials are in %LOCALAPPDATA%\SchoolHub\data\bootstrap-superadmin.txt after first launch." }
