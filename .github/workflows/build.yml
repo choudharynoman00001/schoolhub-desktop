@@ -37,9 +37,20 @@ jobs:
       - name: Build NSIS installer
         shell: pwsh
         run: |
-          choco install nsis --no-progress -y
+          $mk = Get-Command makensis -ErrorAction SilentlyContinue
+          $try = 0
+          while (!$mk -and $try -lt 3) {
+            choco install nsis --no-progress -y
+            $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+            $mk = Get-Command makensis -ErrorAction SilentlyContinue
+            if (!$mk -and (Test-Path 'C:\Program Files (x86)\NSIS\makensis.exe')) { $mk = @{ Source = 'C:\Program Files (x86)\NSIS\makensis.exe' } }
+            $try++
+            if (!$mk) { Start-Sleep -Seconds 20 }
+          }
+          if (!$mk) { throw 'makensis unavailable after retries (choco feed issue)' }
           Push-Location p\installer
-          makensis /V2 schoolhub.nsi
+          & $mk.Source /V2 schoolhub.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
           Pop-Location
           $exe = Get-ChildItem -Recurse -Filter 'SchoolHub-Manager-Setup.exe' | Select-Object -First 1
           if (!$exe) { throw 'installer not produced' }
