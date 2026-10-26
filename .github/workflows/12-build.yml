@@ -1,0 +1,93 @@
+name: Build Windows installer
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand payload (sanitized app + installer files)
+        shell: pwsh
+        run: |
+          Expand-Archive payload.zip -DestinationPath p
+          if (!(Test-Path p\app\server.js)) { throw 'payload missing app/server.js' }
+          if (!(Test-Path p\installer\schoolhub.nsi)) { throw 'payload missing installer/schoolhub.nsi' }
+      - name: Download portable Node runtime (latest v22 win-x64)
+        shell: pwsh
+        run: |
+          $sums = (Invoke-WebRequest 'https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt').Content
+          $name = ([regex]::Match($sums, 'node-v22[\d.]*-win-x64\.zip')).Value
+          if (!$name) { throw 'could not resolve latest v22 win-x64 zip name' }
+          Invoke-WebRequest "https://nodejs.org/dist/latest-v22.x/$name" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath noder
+          New-Item -ItemType Directory -Force p\payload\runtime | Out-Null
+          Copy-Item "noder\$($name -replace '\.zip$','')\node.exe" p\payload\runtime\node.exe
+      - name: Assemble installer payload (app code only; no tests/docs/private data)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force p\payload\app | Out-Null
+          Copy-Item p\app\server.js, p\app\package.json p\payload\app\
+          Copy-Item -Recurse p\app\public p\payload\app\public
+          Copy-Item p\installer\launcher.vbs, p\installer\stop.vbs, p\installer\README-FIRST.txt p\payload\
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          $mk = Get-Command makensis -ErrorAction SilentlyContinue
+          $try = 0
+          while (!$mk -and $try -lt 3) {
+            choco install nsis --no-progress -y
+            $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+            $mk = Get-Command makensis -ErrorAction SilentlyContinue
+            if (!$mk -and (Test-Path 'C:\Program Files (x86)\NSIS\makensis.exe')) { $mk = @{ Source = 'C:\Program Files (x86)\NSIS\makensis.exe' } }
+            $try++
+            if (!$mk) { Start-Sleep -Seconds 20 }
+          }
+          if (!$mk) { throw 'makensis unavailable after retries (choco feed issue)' }
+          Push-Location p\installer
+          & $mk.Source /V2 schoolhub.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
+          Pop-Location
+          $exe = Get-ChildItem -Recurse -Filter 'SchoolHub-Manager-Setup.exe' | Select-Object -First 1
+          if (!$exe) { throw 'installer not produced' }
+          Copy-Item $exe.FullName .\SchoolHub-Manager-Setup.exe -Force
+          (Get-Item .\SchoolHub-Manager-Setup.exe).Length
+      - name: Smoke test on real Windows (install, launch, login, write, restart, data)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File p\installer\smoke.ps1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SchoolHub-Manager-Setup
+          path: SchoolHub-Manager-Setup.exe
+      - name: Publish release (automatic GITHUB_TOKEN, no personal token)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ inputs.release_tag }}'
+          $repo = $env:GITHUB_REPOSITORY
+          $notes = 'Windows setup. Installer unsigned: Windows may show Unknown publisher - More info > Run anyway. First login credentials are in %LOCALAPPDATA%\SchoolHub\data\bootstrap-superadmin.txt after first launch.'
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          # ensure the tag ref exists (422 = already exists)
+          try { Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$repo/git/refs" -Headers $h -ContentType 'application/json' -Body (@{ ref = "refs/tags/$tag"; sha = $env:GITHUB_SHA } | ConvertTo-Json) | Out-Null; Write-Host "tag $tag created" }
+          catch { Write-Host "tag $tag already exists" }
+          # get or create the release
+          $rel = $null
+          try { $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" -Headers $h } catch { Write-Host 'release missing, creating' }
+          if (-not $rel) {
+            $rel = Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$repo/releases" -Headers $h -ContentType 'application/json' -Body (@{ tag_name = $tag; name = "SchoolHub Manager $tag"; body = $notes } | ConvertTo-Json)
+            Write-Host "release created: $($rel.html_url)"
+          }
+          # clobber: delete an existing asset with the same name
+          $assets = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($rel.id)/assets" -Headers $h
+          foreach ($a in $assets) { if ($a.name -eq 'SchoolHub-Manager-Setup.exe') { Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$repo/releases/assets/$($a.id)" -Headers $h | Out-Null; Write-Host 'old asset replaced' } }
+          $up = [System.Uri]::EscapeDataString('SchoolHub-Manager-Setup.exe')
+          $uh = $h.Clone(); $uh['Content-Type'] = 'application/octet-stream'
+          Invoke-RestMethod -Method Post -Uri "https://uploads.github.com/repos/$repo/releases/$($rel.id)/assets?name=$up" -Headers $uh -InFile .\SchoolHub-Manager-Setup.exe | Out-Null
+          Write-Host "PUBLISHED $($rel.html_url)" 
